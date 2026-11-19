@@ -1,0 +1,763 @@
+---
+title: "gene_expression_analyses"
+author: "Xiao Chen"
+date: "2026-05-31"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Do Gene expression analyses
+
+```{r initialization}
+library(dplyr)
+library(pls)
+library(ggplot2)
+library(ggseg)
+library(ggsegSchaefer)
+library(RColorBrewer)
+library(scales)
+library(grid)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ggrepel)
+```
+
+## Read in data
+
+```{r}
+rm(list = ls())
+cat("\014")
+
+work_dir <- "xxxxxxxxx"
+# the preprocessed AHBA data
+df <- read.csv("xxxxxx/AHBA_schaefer400_left_cortex_stable_260529_v2.csv")
+# the extracted lnm data
+lnm_raw <- read.csv(paste(work_dir, "/gene_expression/rum_MDD_lnm_vec_left_schaefer400.csv", sep = ""), header = TRUE)
+```
+
+Do PLS
+
+```{r}
+roi_index <- df[[1]]
+gene_df <- df[,-1]
+full_df <- data.frame(index = 1:200)
+full_df <- full_df %>%
+  left_join(
+    cbind(index = roi_index, gene_df),
+    by = "index"
+  )
+
+full_df[is.na(full_df)] <- NaN
+X <- as.matrix(full_df[, -1])
+y <- as.numeric(lnm_raw[[1]])
+stopifnot(length(y) == nrow(X), !anyDuplicated(roi_index),
+          all(roi_index %in% seq_len(nrow(X))))
+
+valid <- is.finite(y) &
+  apply(X,1,function(z) all(is.finite(z)))
+X_valid <- X[valid,]
+y_valid <- y[valid]
+
+cat("Valid parcels:", sum(valid), "\n")
+
+Xz <- scale(X_valid)
+yz <- as.numeric(scale(y_valid))
+
+pls_fit <- plsr(
+  yz ~ Xz,
+  ncomp=10,
+  scale=FALSE
+)
+
+XS1 <- scores(pls_fit)[,1]
+r <- cor(XS1,yz)
+if(r<0){
+  XS1 <- -XS1
+  r <- -r
+}
+
+cat("PLS1 correlation =", round(r,4), "\n")
+cat("R² =", round(r^2,4), "\n")
+
+# explvar() reports X variance in percent, not LNM (response) variance.
+pls1_x_variance_ratio <- unname(explvar(pls_fit)[1]) / 100
+pls1_y_fitted <- as.numeric(fitted(pls_fit)[, 1, 1])
+pls1_lnm_variance_ratio <- 1 - sum((yz - pls1_y_fitted)^2) /
+  sum((yz - mean(yz))^2)
+pls1_rho <- cor(XS1, y_valid, method = "spearman")
+
+cat(sprintf("PLS1 explained X variance: %.6f (%.2f%%)\n",
+            pls1_x_variance_ratio, 100 * pls1_x_variance_ratio))
+cat(sprintf("PLS1 explained LNM variance (in-sample): %.6f (%.2f%%)\n",
+            pls1_lnm_variance_ratio, 100 * pls1_lnm_variance_ratio))
+cat(sprintf("PLS1 score vs LNM spatial Spearman rho: %.6f\n", pls1_rho))
+```
+
+### Spatial rotation test for PLS1 score–LNM correlation
+
+Use the Python environment used by `neuro_transmitter.ipynb` (with
+`numpy`, `nibabel`, `neuromaps`, and `brainspace`) through `reticulate`.
+If needed, set `RETICULATE_PYTHON` before starting R. The left
+Schaefer-400 parcels and fsaverage 10k sphere match that notebook.
+Generate rotations on all 200 left parcels before applying the
+expression-data mask. LNM rows must follow parcel IDs 1–200.
+
+This two-sided test compares the **fixed observed PLS1 score map** with
+rotated LNM maps. It does not refit PLS for each rotation and therefore
+does not test the significance of the supervised PLS fitting procedure
+or out-of-sample prediction.
+
+```{r pls1-spin-settings}
+n_spin <- 5000L
+spin_seed <- 42L
+atlas_lh_file <- file.path(dirname(dirname(work_dir)), "atlas",
+                          "fsaverage5_lh_Schaefer2018_400Parcels_7Networks_order.label.gii")
+stopifnot(file.exists(atlas_lh_file), all(is.finite(y)),
+          is.finite(pls1_rho), sd(y) > 0)
+```
+
+```{python pls1-spatial-rotations}
+import numpy as np
+import nibabel as nib
+from neuromaps.datasets import fetch_atlas
+from brainspace.null_models import SpinPermutations
+
+pls1_sphere = fetch_atlas("fsaverage", "10k")["sphere"][0]
+pls1_vertices = nib.load(pls1_sphere).darrays[0].data
+pls1_labels = nib.load(r.atlas_lh_file).darrays[0].data.astype(int)
+if (len(pls1_labels) != len(pls1_vertices) or
+        not np.array_equal(np.unique(pls1_labels[pls1_labels > 0]), np.arange(1, 201))):
+    raise ValueError("Expected left parcel IDs 1–200 on the fsaverage 10k sphere.")
+pls1_centroids = np.asarray([
+    pls1_vertices[pls1_labels == parcel].mean(axis=0)
+    for parcel in range(1, 201)
+])
+pls1_centroids /= np.linalg.norm(pls1_centroids, axis=1, keepdims=True)
+if not np.isfinite(pls1_centroids).all():
+    raise ValueError("Invalid spherical parcel centroids.")
+pls1_spin = SpinPermutations(n_rep=int(r.n_spin), random_state=int(r.spin_seed))
+pls1_spin.fit(pls1_centroids)
+pls1_lnm_spins = pls1_spin.randomize(np.asarray(r.y, dtype=float).reshape(-1))
+```
+
+```{r pls1-spin-results}
+lnm_spins <- reticulate::py$pls1_lnm_spins
+stopifnot(identical(dim(lnm_spins), c(n_spin, length(y))))
+spin_rho <- apply(lnm_spins[, valid, drop = FALSE], 1, function(rotated_y) {
+  if (any(!is.finite(rotated_y)) || sd(rotated_y) == 0) return(NA_real_)
+  cor(XS1, rotated_y, method = "spearman")
+})
+if (any(!is.finite(spin_rho))) {
+  stop("Undefined spin correlations; inspect the rotated maps before reporting p.")
+}
+pls1_p_spin <- (1 + sum(abs(spin_rho) >= abs(pls1_rho))) / (n_spin + 1)
+
+pls1_summary <- data.frame(
+  component = 1L,
+  n_parcels = sum(valid),
+  x_explained_variance_ratio = pls1_x_variance_ratio,
+  lnm_explained_variance_ratio = pls1_lnm_variance_ratio,
+  rho = pls1_rho,
+  p_spin = pls1_p_spin,
+  n_spin = n_spin,
+  seed = spin_seed,
+  correlation_method = "spearman",
+  alternative = "two.sided",
+  spin_test = "fixed_score_map"
+)
+pls1_out_dir <- file.path(work_dir, "gene_expression")
+dir.create(pls1_out_dir, recursive = TRUE, showWarnings = FALSE)
+write.csv(pls1_summary, file.path(pls1_out_dir, "PLS1_spatial_summary.csv"),
+          row.names = FALSE)
+write.csv(data.frame(rotation = seq_len(n_spin), rho = spin_rho),
+          file.path(pls1_out_dir, "PLS1_spatial_null_rho.csv"), row.names = FALSE)
+print(pls1_summary)
+cat(sprintf("PLS1 score vs LNM: Spearman rho = %.6f, spatial rotation p = %.6g (%d spins)\n",
+            pls1_rho, pls1_p_spin, n_spin))
+```
+
+Scatter plot
+
+```{r}
+out_image <- paste(work_dir, "/plots/scatter_plot.png", sep = "")
+explained_x <- explvar(pls_fit)
+
+scree_df <- data.frame(
+  component = seq_along(explained_x),
+  explained_variance = explained_x
+)
+
+p <- ggplot(
+  scree_df,
+  aes(
+    x = component,
+    y = explained_variance
+  )
+) +
+  geom_line(
+    linewidth = 0.6,
+    colour = "black"
+  ) +
+  geom_point(
+    size = 4.5,
+    shape = 21,
+    fill = "black",
+    colour = "black",
+    stroke = 0.4
+  ) +
+  scale_x_continuous(
+    breaks = scree_df$component
+  ) +
+  labs(
+    x = "PLS component",
+    y = "Explained X variance (%)"
+  ) +
+  theme_classic(base_family = "Arial") +
+  theme(
+    axis.title = element_text(
+      size = 18
+    ),
+    axis.text = element_text(
+      size = 15,
+      colour = "black"
+    ),
+    axis.line = element_line(
+      linewidth = 0.8,
+      colour = "black"
+    ),
+    axis.ticks = element_line(
+      linewidth = 0.8,
+      colour = "black"
+    ),
+    axis.ticks.length = unit(0.22, "cm")
+  )
+
+ggsave(
+  filename = out_image, plot = p, width = 120, height = 90, units = "mm", dpi = 600
+)
+```
+
+Legacy: Use ggseg to plot the PLS component 1 score
+
+```{r}
+PLS1_valid <- scores(pls_fit)[,1]
+if(cor(PLS1_valid,y_valid)<0){
+  PLS1_valid <- -PLS1_valid
+}
+PLS1_full <- rep(NaN,200)
+PLS1_full[valid] <- PLS1_valid
+
+atlas_use <- schaefer7_400()
+lh_regions <- atlas_use$core$region[1:200]
+PLS_df <- tibble(
+  parcel = 1:200,
+  region = lh_regions,
+  score = as.numeric(PLS1_full)
+)
+
+pls_score_file <- file.path(
+  work_dir,
+  "gene_expression",
+  "PLS_component1_score.csv"
+)
+dir.create(
+  dirname(pls_score_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+write.csv(
+  PLS_df,
+  pls_score_file,
+  row.names = FALSE,
+  na = "NA"
+)
+cat("PLS component 1 scores saved to:", pls_score_file, "\n")
+```
+
+```{r}
+q99 <- max(abs(quantile(
+  PLS_df$score,
+  probs = c(.01,.99),
+  na.rm = TRUE
+)))
+
+p <- ggplot(PLS_df) +
+  geom_brain(
+    atlas = schaefer7_400(),
+    position = position_brain(hemi ~ view, views = c("lateral","medial")),
+    aes(fill = score),
+    hemi = "left",
+    colour = "grey70",
+    size = 0.05
+  ) +
+  scale_fill_gradientn(
+    colors = rev(RColorBrewer::brewer.pal(11,"RdBu")),
+    limits = c(-q99,q99),
+    oob = squish,
+    name = "PLS 1"
+  ) +
+  theme_void() +
+  theme(
+    text = element_text(
+      size = 16,
+      family = "Arial",
+      colour = "grey7",
+      face = "bold"
+    ),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.key.width = unit(2,"cm")
+  )
+p
+
+ggsave(
+  "/Users/Chenxiao/Documents/project_codes/rumination_casual_mapping/analyses/stable_260609/PLS1_left.png",
+  plot = p,
+  width = 180,
+  height = 70,
+  units = "mm",
+  dpi = 300,
+)
+```
+
+Bootstrap
+
+```{r}
+gene_names <- colnames(Xz)
+w_emp <- loading.weights(pls_fit)[, 1]
+if (cor(scores(pls_fit)[, 1], yz) < 0) {
+  w_emp <- -w_emp
+}
+
+bootnum <- 1000
+
+boot_weights <- matrix(
+  NA,
+  nrow = ncol(Xz),
+  ncol = bootnum
+)
+
+set.seed(42)
+
+pb <- txtProgressBar(
+  min = 0,
+  max = bootnum,
+  style = 3
+)
+
+for (i in 1:bootnum) {
+  idx <- sample(
+    1:nrow(Xz),
+    size = nrow(Xz),
+    replace = TRUE
+  )
+  
+  fit_b <- plsr(
+    yz[idx] ~ Xz[idx, ],
+    ncomp = 1,
+    scale = FALSE,
+    validation = "none"
+  )
+  
+  w_b <- loading.weights(fit_b)[, 1]
+  
+  # align bootstrap weights to empirical weights
+  
+  if (cor(w_emp, w_b, use = "complete.obs") < 0) {
+    w_b <- -w_b
+  }
+  boot_weights[, i] <- w_b
+  setTxtProgressBar(pb,i)
+}
+
+boot_se <- apply(
+  boot_weights,
+  1,
+  sd,
+  na.rm = TRUE
+)
+
+gene_z <- w_emp / boot_se
+```
+
+```{r}
+gene_z_df <- data.frame(
+  gene = gene_names,
+  weight = w_emp,
+  boot_se = boot_se,
+  z = gene_z
+)
+
+gene_z_df <- gene_z_df[is.finite(gene_z_df$z), ]
+gene_z_df <- gene_z_df[order(gene_z_df$z, decreasing = TRUE), ]
+# head(gene_z_df)
+
+sig_gene_pos <- gene_z_df$gene[gene_z_df$z > 3]
+sig_gene_neg <- gene_z_df$gene[gene_z_df$z < -3]
+sig_gene_abs <- gene_z_df$gene[abs(gene_z_df$z) > 3]
+
+length(sig_gene_pos)
+length(sig_gene_neg)
+length(sig_gene_abs)
+```
+
+```{r}
+out_dir <- paste(work_dir, "/gene_expression", sep = "")
+
+write.csv(
+  gene_z_df,
+  file.path(out_dir, "PLS1_gene_bootstrap_Z.csv"),
+  row.names = FALSE
+)
+
+write.table(
+  sig_gene_pos,
+  file.path(out_dir, "PLS1_positive_Zgt3_genes.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+write.table(
+  sig_gene_neg,
+  file.path(out_dir, "PLS1_negative_Zltminus3_genes.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+write.table(
+  sig_gene_abs,
+  file.path(out_dir, "PLS1_abs_Zgt3_genes.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+```
+
+GO analyses
+
+Positive
+
+```{r}
+ego_pos_bp <- enrichGO(
+  gene          = sig_gene_pos,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ego_pos_mf <- enrichGO(
+  gene          = sig_gene_pos,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ego_pos_cc <- enrichGO(
+  gene          = sig_gene_pos,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "CC",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+write.csv(as.data.frame(ego_pos_bp), paste(out_dir, "/PLS1_pos_GO_BP.csv", sep = ""), row.names = FALSE)
+write.csv(as.data.frame(ego_pos_mf), paste(out_dir, "/PLS1_pos_GO_MF.csv", sep = ""), row.names = FALSE)
+write.csv(as.data.frame(ego_pos_cc), paste(out_dir, "/PLS1_pos_GO_CC.csv", sep = ""), row.names = FALSE)
+```
+
+GO analyses
+
+Negative
+
+```{r}
+ego_neg_bp <- enrichGO(
+  gene          = sig_gene_neg,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ego_neg_mf <- enrichGO(
+  gene          = sig_gene_neg,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ego_neg_cc <- enrichGO(
+  gene          = sig_gene_neg,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "CC",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+write.csv(as.data.frame(ego_neg_bp), paste(out_dir, "/PLS1_neg_GO_BP.csv", sep = ""), row.names = FALSE)
+write.csv(as.data.frame(ego_neg_mf), paste(out_dir, "/PLS1_neg_GO_MF.csv", sep = ""), row.names = FALSE)
+write.csv(as.data.frame(ego_neg_cc), paste(out_dir, "/PLS1_neg_GO_CC.csv", sep = ""), row.names = FALSE)
+```
+
+Legacy code: dot plot
+
+```{r}
+p <- dotplot(ego_pos_bp, showCategory = 20) +
+  ggtitle("PLS1 positive genes: GO Biological Process")
+
+ggsave(
+  "/Users/Chenxiao/Documents/project_codes/rumination_casual_mapping/analyses/gene_expression/PLS1_positive_genes_GO.png",
+  plot = p,
+  width = 200,
+  height = 180,
+  units = "mm",
+  dpi = 300,
+)
+```
+
+Bubble plot
+
+positive
+
+```{r}
+ego_all_df <- bind_rows(
+  as.data.frame(ego_pos_bp) %>% mutate(ONTOLOGY = "BP"),
+  as.data.frame(ego_pos_mf) %>% mutate(ONTOLOGY = "MF"),
+  as.data.frame(ego_pos_cc) %>% mutate(ONTOLOGY = "CC")
+)
+
+plot_df <- ego_all_df %>%
+  mutate(
+    GeneRatio_num = sapply(GeneRatio, function(x) eval(parse(text = x))),
+    GeneRatio_log2 = log2(GeneRatio_num * 100),
+    minuslog10p = -log10(pvalue)
+  ) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 30)
+
+plot_df2 <- plot_df %>%
+  as.data.frame() %>%
+  tibble::as_tibble()
+
+# top3 <- plot_df2 %>%
+#  dplyr::arrange(dplyr::desc(minuslog10p)) %>%
+#  dplyr::slice_head(n = 3)
+
+# mannually adjust the labels here
+top_terms <- bind_rows(
+  plot_df2 %>%
+    filter(ONTOLOGY == "BP") %>%
+    slice_max(
+      order_by = minuslog10p,
+      n = 0,
+      with_ties = FALSE
+    ),
+  plot_df2 %>%
+    filter(ONTOLOGY == "MF") %>%
+    slice_max(
+      order_by = minuslog10p,
+      n = 0,
+      with_ties = FALSE
+    ),
+  plot_df2 %>%
+    filter(ONTOLOGY == "CC") %>%
+    slice_max(
+      order_by = minuslog10p,
+      n = 3,
+      with_ties = FALSE
+    )
+)
+```
+
+```{r}
+p <- ggplot(plot_df2, aes(x = GeneRatio_log2, y = minuslog10p)) +
+  geom_point(aes(size = Count, colour = ONTOLOGY), alpha = 0.85) +
+  geom_text_repel(
+    data = top_terms, aes(label = Description),
+    size = 6,
+    family = "Arial",
+    fontface = "plain",
+    colour = "black",
+    segment.color = "grey50",
+    segment.size = 0.3,
+    box.padding = 0.35,
+    point.padding = 0.2,
+    max.overlaps = Inf
+  ) +
+  scale_colour_manual(
+    values = c(
+      BP = "#C44E52",   # firebrick
+      MF = "#4C72B0",   # blue
+      CC = "#55A868"    # sea green
+    ),
+    name = "GO category") +
+  scale_size_continuous(name = "Gene count", range = c(2.5, 7)) +
+  labs(
+    x = expression(log[2]("Gene ratio")),
+    y = expression(-log[10](italic(P)))
+  ) +
+  theme_classic(base_family = "Arial") +
+  theme(
+    text = element_text(colour = "black", size = 16),
+    axis.title = element_text(size = 24,face = "plain"),
+    axis.text = element_text(size = 16),
+    axis.line = element_line(linewidth = 0.45),
+    axis.ticks = element_line(linewidth = 0.45),
+    axis.ticks.length = unit(2.5, "mm"),
+    legend.position = "right",
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 16)
+    )
+
+p
+ggsave(
+  paste(out_dir, "/PLS1_positive_genes_GO_bubble.png", sep = ""),
+  plot = p,
+  width = 160,
+  height = 140,
+  units = "mm",
+  dpi = 600,
+)
+```
+
+negative
+
+```{r}
+ego_all_df <- bind_rows(
+  as.data.frame(ego_neg_bp) %>% mutate(ONTOLOGY = "BP"),
+  as.data.frame(ego_neg_mf) %>% mutate(ONTOLOGY = "MF"),
+  as.data.frame(ego_neg_cc) %>% mutate(ONTOLOGY = "CC")
+)
+
+plot_df <- ego_all_df %>%
+  mutate(
+    GeneRatio_num = sapply(GeneRatio, function(x) eval(parse(text = x))),
+    GeneRatio_log2 = log2(GeneRatio_num * 100),
+    minuslog10p = -log10(pvalue)
+  ) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 30)
+
+plot_df2 <- plot_df %>%
+  as.data.frame() %>%
+  tibble::as_tibble()
+
+# top3 <- plot_df2 %>%
+#  dplyr::arrange(dplyr::desc(minuslog10p)) %>%
+#  dplyr::slice_head(n = 3)
+
+top_terms <- bind_rows(
+  plot_df2 %>%
+    filter(ONTOLOGY == "BP") %>%
+    slice_max(
+      order_by = minuslog10p,
+      n = 0,
+      with_ties = FALSE
+    ),
+  plot_df2 %>%
+    filter(ONTOLOGY == "MF") %>%
+    slice_max(
+      order_by = minuslog10p,
+      n = 2,
+      with_ties = FALSE
+    ),
+  plot_df2 %>%
+    filter(ONTOLOGY == "CC") %>%
+    slice_max(
+      order_by = minuslog10p,
+      n = 1,
+      with_ties = FALSE
+    )
+)
+```
+
+```{r}
+p <- ggplot(
+  plot_df2,
+  aes(x = GeneRatio_log2, y = minuslog10p)
+) +
+  geom_point(
+    aes(size = Count, colour = ONTOLOGY),
+    alpha = 0.85
+  ) +
+  geom_text_repel(data = top_terms,
+    aes(label = Description),
+    size = 4.5,
+    family = "Arial",
+    fontface = "plain",
+    colour = "black",
+    segment.color = "grey50",
+    segment.size = 0.3,
+    box.padding = 0.35,
+    point.padding = 0.2,
+    max.overlaps = Inf
+  ) +
+  scale_colour_manual(
+    values = c(
+      BP = "#C44E52",   # firebrick
+      MF = "#4C72B0",   # blue
+      CC = "#55A868"    # sea green
+    ),
+    name = "GO category"
+  ) +
+  scale_size_continuous(name = "Gene count", range = c(2.5, 7)) +
+  labs(
+    x = expression(log[2]("Gene ratio")),
+    y = expression(-log[10](italic(P)))
+  ) +
+  theme_classic(base_family = "Arial") +
+  theme(
+    text = element_text(colour = "black", size = 16),
+    axis.title = element_text(size = 24, face = "plain"),
+    axis.text = element_text(size = 16),
+    axis.line = element_line(linewidth = 0.45),
+    axis.ticks = element_line(linewidth = 0.45),
+    axis.ticks.length = unit(2.5, "mm"),
+    legend.position = "right",
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 16)
+  )+
+  guides(
+    size = guide_legend(order = 1),
+    colour = guide_legend(order = 2)
+  )
+
+p
+ggsave(
+  paste(out_dir, "/PLS1_negative_genes_GO_bubble.png", sep = ""),
+  plot = p,
+  width = 160,
+  height = 140,
+  units = "mm",
+  dpi = 600,
+)
+```
